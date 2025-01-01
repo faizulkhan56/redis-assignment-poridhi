@@ -1,123 +1,144 @@
 const express = require("express");
 const redis = require("redis");
 const path = require("path");
-
+const morgan = require("morgan");
+const logger = require("./logger");
+const client = require("prom-client");
 
 // Redis client setup
-const client = redis.createClient({
-  socket: {
-    host: "localhost",
-    port: 6379,
-  },
+const redisClient = redis.createClient({
+    socket: {
+        host: "localhost",
+        port: 6379,
+    },
 });
-
-client.connect().catch(console.error);
+redisClient.connect().catch(console.error);
 
 const app = express();
 app.use(express.json());
+app.use(morgan("combined", { stream: { write: (message) => logger.info(message.trim()) } }));
 app.use("/", express.static(path.join(__dirname, "frontend")));
-// Get all jobs in the queue, sorted by priority
-app.get('/tasks', (req, res) => {
-    client.zRangeWithScores('taskQueue', 0, -1)
-        .then(jobs => {
-            if (jobs.length === 0) {
-                return res.status(404).json({ message: 'No jobs in the queue' });
-            }
 
-            const parsedJobs = jobs.map(job => ({
+// Prometheus metrics setup
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+const jobProcessedCounter = new client.Counter({
+    name: "jobs_processed_total",
+    help: "Total number of jobs processed",
+});
+register.registerMetric(jobProcessedCounter);
+
+const httpRequestDuration = new client.Histogram({
+    name: "http_request_duration_seconds",
+    help: "Histogram of HTTP request durations in seconds",
+    labelNames: ["method", "route", "status_code"],
+});
+register.registerMetric(httpRequestDuration);
+
+app.use((req, res, next) => {
+    const end = httpRequestDuration.startTimer();
+    res.on("finish", () => {
+        end({ method: req.method, route: req.route?.path || req.url, status_code: res.statusCode });
+    });
+    next();
+});
+
+// API Endpoints
+app.get("/tasks", (req, res) => {
+    redisClient.zRangeWithScores("taskQueue", 0, -1)
+        .then((jobs) => {
+            if (jobs.length === 0) {
+                return res.status(404).json({ message: "No jobs in the queue" });
+            }
+            const parsedJobs = jobs.map((job) => ({
                 ...JSON.parse(job.value),
                 priority: job.score,
             }));
-
             res.status(200).json({ tasks: parsedJobs });
         })
-        .catch(err => {
+        .catch((err) => {
+            logger.error(`Error fetching tasks: ${err.message}`);
             res.status(500).json({ error: err.message });
         });
 });
 
-// Add a new job to the queue with a priority
-app.post('/tasks', (req, res) => {
+app.post("/tasks", (req, res) => {
     const { type, priority, data } = req.body;
 
-    if (!type || typeof priority === 'undefined' || !data) {
-        return res.status(400).json({ error: 'Job type, priority, and data are required' });
+    if (!type || typeof priority === "undefined" || !data) {
+        logger.warn("Task creation failed: Missing parameters");
+        return res.status(400).json({ error: "Job type, priority, and data are required" });
     }
 
-    const jobId = `job-${Date.now()}`; // Unique Job ID
-    const job = {
-        id: jobId,
-        type,
-        priority,
-        data,
-        status: 'pending', // Initialize with "pending" status
-        createdAt: new Date().toISOString(),
-    };
+    const jobId = `job-${Date.now()}`;
+    const job = { id: jobId, type, priority, data, status: "pending", createdAt: new Date().toISOString() };
 
     Promise.all([
-        client.zAdd('taskQueue', { score: priority, value: JSON.stringify(job) }),
-        client.hSet('jobStatus', jobId, JSON.stringify({ status: 'pending', job })),
+        redisClient.zAdd("taskQueue", { score: priority, value: JSON.stringify(job) }),
+        redisClient.hSet("jobStatus", jobId, JSON.stringify({ status: "pending", job })),
     ])
         .then(() => {
-            res.status(200).json({ message: 'Job added to queue', jobId });
+            logger.info(`Job added to queue: ${jobId}`);
+            res.status(200).json({ message: "Job added to queue", jobId });
         })
-        .catch(err => {
+        .catch((err) => {
+            logger.error(`Error adding job to queue: ${err.message}`);
             res.status(500).json({ error: err.message });
         });
 });
 
-// Process the highest-priority job
-app.get('/tasks/process', (req, res) => {
-    client.zPopMin('taskQueue')
-        .then(job => {
+app.get("/tasks/process", (req, res) => {
+    redisClient.zPopMin("taskQueue")
+        .then((job) => {
             if (!job || job.length === 0) {
-                return res.status(404).json({ message: 'No jobs in the queue' });
+                return res.status(404).json({ message: "No jobs in the queue" });
             }
-
-            const jobData = job.value || job[0];
-            const parsedJob = JSON.parse(jobData);
-
-            return client.hSet('jobStatus', parsedJob.id, JSON.stringify({ status: 'processing', job: parsedJob }))
+            const parsedJob = JSON.parse(job.value || job[0]);
+            return redisClient.hSet("jobStatus", parsedJob.id, JSON.stringify({ status: "processing", job: parsedJob }))
                 .then(() => {
-                    console.log(`Processing job: ${parsedJob.id}`);
-                    if (Math.random() < 0.3) { // Simulate a 30% failure rate
-                        throw new Error('Job failed');
-                    }
-                    return new Promise((resolve) => setTimeout(resolve, 2000)); // Simulate 2s delay
+                    jobProcessedCounter.inc();
+                    logger.info(`Processing job: ${parsedJob.id}`);
+                    return new Promise((resolve) => setTimeout(resolve, 2000)); // Simulate processing
                 })
                 .then(() => {
-                    return client.hSet('jobStatus', parsedJob.id, JSON.stringify({ status: 'completed', job: parsedJob }));
+                    return redisClient.hSet("jobStatus", parsedJob.id, JSON.stringify({ status: "completed", job: parsedJob }));
                 })
                 .then(() => {
-                    res.status(200).json({ message: 'Job processed', job: parsedJob });
+                    res.status(200).json({ message: "Job processed", job: parsedJob });
                 })
-                .catch(err => {
-                    client.hSet('jobStatus', parsedJob.id, JSON.stringify({ status: 'failed', job: parsedJob }))
-                        .then(() => {
-                            res.status(500).json({ message: `Job failed: ${err.message}`, job: parsedJob });
-                        });
+                .catch((err) => {
+                    redisClient.hSet("jobStatus", parsedJob.id, JSON.stringify({ status: "failed", job: parsedJob }));
+                    logger.error(`Job failed: ${err.message}`);
+                    res.status(500).json({ message: `Job failed: ${err.message}`, job: parsedJob });
                 });
         });
 });
 
-// Get the status of a specific job
-app.get('/tasks/status/:jobId', (req, res) => {
-    const { jobId } = req.params;
-
-    client.hGet('jobStatus', jobId)
-        .then(status => {
+app.get("/tasks/status/:jobId", (req, res) => {
+    redisClient.hGet("jobStatus", req.params.jobId)
+        .then((status) => {
             if (!status) {
-                return res.status(404).json({ message: 'Job not found' });
+                return res.status(404).json({ message: "Job not found" });
             }
-
             res.status(200).json(JSON.parse(status));
         })
-        .catch(err => {
+        .catch((err) => {
+            logger.error(`Error fetching job status: ${err.message}`);
             res.status(500).json({ error: err.message });
         });
 });
 
-// Start the server
+app.get("/metrics", async (req, res) => {
+    res.set("Content-Type", register.contentType);
+    res.end(await register.metrics());
+});
+
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "OK", uptime: process.uptime(), timestamp: new Date() });
+});
+
+// Start server
 app.listen(4040, () => {
-    console.log("Listening on port 4040");
+    logger.info("Server started on port 4040");
 });
