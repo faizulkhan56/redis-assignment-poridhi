@@ -1,0 +1,15 @@
+{
+  "name": "poridhi-assignment-redis",
+  "version": "1.0.0",
+  "main": "list.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.21.0",
+    "redis": "^4.7.0"
+  }
+  
+}
